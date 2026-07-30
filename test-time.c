@@ -9,18 +9,9 @@
  *
  * Prints the wall clock as reported by clock_gettime(2), gettimeofday(2)
  * and time(2), through their ordinary libc wrappers, once before and once
- * after a real sleep(3). On x86-64 those reads are normally served
- * straight out of the vDSO without ever making a real syscall, so this
- * only gets faked under faketime-bpf because it disables the vDSO for the
- * traced process (see disable_vdso() in faketime-bpf.c).
- *
- * The two rounds distinguish freeze mode (both rounds report the exact
- * same instant, however much real time elapses in between) from flow mode
- * (the second round reports the first plus however long the real sleep
- * actually took). Everything runs in a single process with no fork/exec
- * in between, so there is no second exec-stop to disable the vDSO again
- * and nothing that could deliver a signal requiring the tracer to
- * intervene.
+ * after a real sleep(3). Under freeze mode both rounds report the same
+ * instant; under flow mode the second round is the first plus however
+ * long the sleep took.
  */
 
 #define _GNU_SOURCE

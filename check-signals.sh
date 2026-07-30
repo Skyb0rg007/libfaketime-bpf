@@ -4,17 +4,10 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# Verify faketime-bpf's signal handling:
-#   - a signal sent straight to the faketime-bpf process (not its whole
-#     process group) is relayed to the tracee, rather than either being
-#     ignored or killing faketime-bpf out from under it;
-#   - PTRACE_O_EXITKILL cleans up the tracee if faketime-bpf itself is
-#     killed uncatchably;
-#   - a tracee that forks/execs children of its own (e.g. a shell) no
-#     longer deadlocks the first time one of those children exits and
-#     delivers SIGCHLD to the tracee -- ptrace stops on every signal
-#     delivery, not just exec, and that stop must be continued by the
-#     tracer or the tracee (and anything waiting on it) hangs forever.
+# Verify faketime-bpf's signal handling: a signal sent straight to the
+# faketime-bpf process is relayed to the tracee; PTRACE_O_EXITKILL cleans
+# up the tracee if faketime-bpf is killed uncatchably; and a tracee whose
+# own children exit (delivering it SIGCHLD) does not deadlock.
 set -u
 
 status=0
@@ -86,7 +79,7 @@ then
 else
     rc=$?
     if [ "$rc" -eq 124 ]; then
-        echo "FAIL: sh -c scenario hung (previously deadlocked on the first SIGCHLD)" >&2
+        echo "FAIL: sh -c scenario hung" >&2
     else
         echo "FAIL: sh -c scenario exited $rc" >&2
     fi

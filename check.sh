@@ -4,11 +4,9 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# Verify faketime-bpf actually intercepts clock_gettime(2)/gettimeofday(2)/
-# time(2) for a program that uses their ordinary libc wrappers (test-time),
-# which requires disabling the vDSO -- and that freeze/flow mode behave as
-# advertised across a real 1-second sleep in between test-time's two rounds
-# of reads.
+# Verify faketime-bpf intercepts clock_gettime(2)/gettimeofday(2)/time(2)
+# for a program using their ordinary libc wrappers, and that freeze/flow
+# mode behave as advertised across a real 1-second sleep.
 set -eu
 
 epoch=1700000000
