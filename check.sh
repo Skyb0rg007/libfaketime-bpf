@@ -5,8 +5,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 # Verify faketime-bpf actually intercepts clock_gettime(2)/gettimeofday(2)/
-# time(2) for a program that issues them as raw syscalls (test-time),
-# bypassing the vDSO.
+# time(2) for a program that uses their ordinary libc wrappers (test-time),
+# which requires disabling the vDSO -- and that freeze/flow mode behave as
+# advertised across a real 1-second sleep in between test-time's two rounds
+# of reads.
 set -eu
 
 epoch=1700000000
@@ -15,20 +17,41 @@ real=$(./test-time)
 echo "unfaked:"
 echo "$real" | sed 's/^/  /'
 
-fake=$(./faketime-bpf "@$epoch" ./test-time)
-echo "faked (epoch=$epoch):"
-echo "$fake" | sed 's/^/  /'
-
 status=0
-for want in "clock_gettime: $epoch.000000000" "gettimeofday: $epoch.000000" "time: $epoch"; do
-    if ! echo "$fake" | grep -qx "$want"; then
-        echo "FAIL: expected line '$want' in faked output" >&2
+
+echo "freeze mode (epoch=$epoch, no '@'):"
+freeze=$(./faketime-bpf "$epoch" ./test-time)
+echo "$freeze" | sed 's/^/  /'
+for want in \
+    "before clock_gettime: $epoch.000000000" "before gettimeofday: $epoch.000000" "before time: $epoch" \
+    "after clock_gettime: $epoch.000000000"  "after gettimeofday: $epoch.000000"  "after time: $epoch"
+do
+    if ! echo "$freeze" | grep -qx "$want"; then
+        echo "FAIL: expected line '$want' in freeze-mode output" >&2
         status=1
     fi
 done
 
+echo "flow mode (epoch=@$epoch):"
+flow=$(./faketime-bpf "@$epoch" ./test-time)
+echo "$flow" | sed 's/^/  /'
+
+before_time=$(echo "$flow" | awk '/^before time:/ { print $3 }')
+after_time=$(echo "$flow" | awk '/^after time:/ { print $3 }')
+
+if [ "$before_time" -lt "$epoch" ] || [ "$before_time" -gt "$((epoch + 1))" ]; then
+    echo "FAIL: flow-mode 'before time' ($before_time) not close to epoch ($epoch)" >&2
+    status=1
+fi
+
+elapsed=$((after_time - before_time))
+if [ "$elapsed" -lt 1 ] || [ "$elapsed" -gt 2 ]; then
+    echo "FAIL: flow-mode elapsed time (${elapsed}s) is not ~1s after test-time's sleep(1)" >&2
+    status=1
+fi
+
 if [ "$status" -eq 0 ]; then
-    echo "PASS: clock_gettime, gettimeofday and time were all faked, including their zeroed sub-second fields"
+    echo "PASS: freeze mode stays fixed across a real sleep; flow mode advances with it"
 fi
 
 exit "$status"

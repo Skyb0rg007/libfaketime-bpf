@@ -10,8 +10,16 @@
  * Run a command with a faked wall clock, without LD_PRELOAD.
  *
  * Minimal first cut: only clock_gettime(2), gettimeofday(2) and time(2)
- * are intercepted, and the fake time is a single fixed unix epoch (no
- * "flowing" mode, no relative offsets, no date parsing).
+ * are intercepted, and the fake time is a single unix epoch, with no
+ * relative offsets and no date parsing. Following libfaketime's own CLI
+ * convention, the TIME argument's format selects one of two modes:
+ *
+ *   'EPOCH'   freeze: the clock is stopped dead at that instant; every
+ *             read returns exactly that value, however much real time
+ *             elapses.
+ *   '@EPOCH'  flow: the target is combined with the live real clock, so
+ *             the faked time keeps advancing at real speed from there
+ *             (e.g. sleeping for 1 second advances it by 1 second too).
  *
  * On x86-64, glibc/musl serve clock_gettime(CLOCK_REALTIME) and
  * gettimeofday() straight out of the vDSO -- a read-only page the kernel
@@ -67,6 +75,66 @@
 #else
 #error "faketime-bpf: disable_vdso() is not implemented for this architecture"
 #endif
+
+/*
+ * FT_MODE_FREEZE - the wall clock is stopped dead at the target instant;
+ *                  every read returns exactly the same value forever.
+ * FT_MODE_FLOW   - the target is a "start-at" instant; the wall clock
+ *                  keeps advancing at real speed from there.
+ */
+typedef enum { FT_MODE_FREEZE, FT_MODE_FLOW } faketime_mode_t;
+
+static int64_t timespec_to_ns(const struct timespec *ts)
+{
+    return (int64_t)ts->tv_sec * 1000000000LL + ts->tv_nsec;
+}
+
+static void ns_to_timespec(int64_t total_ns, struct timespec *ts)
+{
+    int64_t sec  = total_ns / 1000000000LL;
+    int64_t nsec = total_ns % 1000000000LL;
+    if (nsec < 0) {
+        nsec += 1000000000LL;
+        sec  -= 1;
+    }
+    ts->tv_sec  = (time_t)sec;
+    ts->tv_nsec = (long)nsec;
+}
+
+/*
+ * Turn a parsed (fake_epoch, mode) pair into the value_ns handle_time_notif()
+ * uses: the frozen target instant itself in FT_MODE_FREEZE, or an offset
+ * from the current real clock in FT_MODE_FLOW.
+ */
+static int64_t make_value_ns(faketime_mode_t mode, time_t fake_epoch)
+{
+    if (mode == FT_MODE_FREEZE)
+        return (int64_t)fake_epoch * 1000000000LL;
+
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    return (int64_t)fake_epoch * 1000000000LL - timespec_to_ns(&now);
+}
+
+/*
+ * Compute the faked wall-clock reading.
+ *
+ * FT_MODE_FREEZE: value_ns is the fixed target instant -- returned as-is,
+ *                 the real clock is never consulted.
+ * FT_MODE_FLOW:   value_ns is an offset added to the live real clock, so
+ *                 the faked time keeps advancing at real speed.
+ */
+static void fake_now(faketime_mode_t mode, int64_t value_ns, struct timespec *ts)
+{
+    if (mode == FT_MODE_FREEZE) {
+        ns_to_timespec(value_ns, ts);
+        return;
+    }
+
+    struct timespec real;
+    clock_gettime(CLOCK_REALTIME, &real);
+    ns_to_timespec(timespec_to_ns(&real) + value_ns, ts);
+}
 
 // Pass a file descriptor over a Unix socket via SCM_RIGHTS
 static int send_fd(int sock, int fd)
@@ -221,8 +289,8 @@ static int write_to_child(pid_t pid, uint64_t remote_addr,
     return 0;
 }
 
-// Service one intercepted syscall, faking wall-time reads to fake_epoch
-static void handle_time_notif(int notif_fd, time_t fake_epoch)
+// Service one intercepted syscall, faking wall-time reads per mode/value_ns
+static void handle_time_notif(int notif_fd, faketime_mode_t mode, int64_t value_ns)
 {
     struct seccomp_notif      *req  = NULL;
     struct seccomp_notif_resp *resp = NULL;
@@ -255,22 +323,31 @@ static void handle_time_notif(int notif_fd, time_t fake_epoch)
             resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
             break;
         }
-        struct timespec ts = { .tv_sec = fake_epoch, .tv_nsec = 0 };
+        struct timespec ts;
+        fake_now(mode, value_ns, &ts);
         if (write_to_child(req->pid, req->data.args[1], &ts, sizeof(ts)) < 0)
             resp->error = -errno;
         break;
     }
 
     case SCMP_SYS(gettimeofday): {
-        struct timeval tv = { .tv_sec = fake_epoch, .tv_usec = 0 };
+        struct timespec ts;
+        fake_now(mode, value_ns, &ts);
+        struct timeval tv = {
+            .tv_sec  = ts.tv_sec,
+            .tv_usec = ts.tv_nsec / 1000,
+        };
         if (write_to_child(req->pid, req->data.args[0], &tv, sizeof(tv)) < 0)
             resp->error = -errno;
         break;
     }
 
     case SCMP_SYS(time): {
-        resp->val = (int64_t)fake_epoch;
-        if (write_to_child(req->pid, req->data.args[0], &fake_epoch, sizeof(fake_epoch)) < 0)
+        struct timespec ts;
+        fake_now(mode, value_ns, &ts);
+        time_t now = ts.tv_sec;
+        resp->val  = (int64_t)now;
+        if (write_to_child(req->pid, req->data.args[0], &now, sizeof(now)) < 0)
             resp->error = -errno;
         break;
     }
@@ -288,10 +365,17 @@ send:
     seccomp_notify_free(req, resp);
 }
 
-// Parse a (possibly '@'-prefixed) unix epoch, e.g. "1700000000" or "@1700000000"
-static int parse_epoch(const char *s, time_t *out)
+/*
+ * Parse a unix epoch, e.g. "1700000000" (freeze) or "@1700000000" (flow;
+ * see FT_MODE_FLOW above).
+ */
+static int parse_time_arg(const char *s, time_t *out, faketime_mode_t *mode)
 {
-    if (*s == '@') s++;
+    *mode = FT_MODE_FREEZE;
+    if (*s == '@') {
+        *mode = FT_MODE_FLOW;
+        s++;
+    }
     if (*s == '\0') return 0;
 
     errno = 0;
@@ -305,7 +389,11 @@ static int parse_epoch(const char *s, time_t *out)
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "usage: %s [@]epoch command [args...]\n", prog);
+    fprintf(stderr,
+            "usage: %s TIME command [args...]\n"
+            "  EPOCH   freeze: clock stopped dead at this instant\n"
+            "  @EPOCH  flow: clock keeps advancing at real speed from here\n",
+            prog);
 }
 
 int main(int argc, char *argv[])
@@ -322,10 +410,12 @@ int main(int argc, char *argv[])
     }
 
     time_t fake_epoch;
-    if (!parse_epoch(argv[1], &fake_epoch)) {
+    faketime_mode_t mode;
+    if (!parse_time_arg(argv[1], &fake_epoch, &mode)) {
         fprintf(stderr, "faketime-bpf: invalid time '%s' (expected [@]epoch)\n", argv[1]);
         return 1;
     }
+    int64_t value_ns = make_value_ns(mode, fake_epoch);
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {
@@ -422,7 +512,7 @@ int main(int argc, char *argv[])
             break;
         }
         if (pfd.revents & POLLIN)
-            handle_time_notif(notif_fd, fake_epoch);
+            handle_time_notif(notif_fd, mode, value_ns);
         if ((pfd.revents & POLLHUP) && !(pfd.revents & POLLIN))
             break;
     }
