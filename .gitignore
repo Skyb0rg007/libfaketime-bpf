@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+result
+result-*
+/.envrc
+*.o
+/faketime-bpf
+/test-time

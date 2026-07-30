@@ -1,0 +1,8 @@
+version = 1
+
+[[annotations]]
+path = [
+    "flake.lock",
+]
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-FileCopyrightText = "2026 Skye Soss <skye@soss.website>"
