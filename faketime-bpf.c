@@ -10,25 +10,35 @@
  * Run a command with a faked wall clock, without LD_PRELOAD.
  *
  * Minimal first cut: only clock_gettime(2), gettimeofday(2) and time(2)
- * are intercepted, the fake time is a single fixed unix epoch (no
- * "flowing" mode, no relative offsets, no date parsing), and the vDSO is
- * left alone. Because clock_gettime/gettimeofday are normally served by
- * the vDSO without ever entering the kernel, this only fakes callers that
- * make the real syscall directly (e.g. via syscall(2), or a libc built
- * without vDSO support) -- see test-time.c.
+ * are intercepted, and the fake time is a single fixed unix epoch (no
+ * "flowing" mode, no relative offsets, no date parsing).
  *
- * Unlike ptrace-based approaches, seccomp user notification does not
- * require attaching to the child at all: the listener fd installed here
- * keeps receiving notifications for every descendant that inherits the
- * filter across fork(2)/exec(2), with no supervision loop beyond polling
- * that one fd.
+ * On x86-64, glibc/musl serve clock_gettime(CLOCK_REALTIME) and
+ * gettimeofday() straight out of the vDSO -- a read-only page the kernel
+ * maps into every process -- without ever making a real syscall, so
+ * seccomp alone cannot intercept them. To force the real syscalls to
+ * happen, the child is ptrace(2)-stopped at its own exec(2) and
+ * AT_SYSINFO_EHDR is zeroed in its freshly built auxv (see disable_vdso()
+ * below); with that entry zeroed, the C runtime skips the vDSO and always
+ * calls the kernel directly for these functions, which the seccomp-bpf
+ * filter (installed by the child itself, right before execvp()) then
+ * traps via SECCOMP_RET_USER_NOTIF.
+ *
+ * The seccomp listener fd is handed from the child to the parent over a
+ * socketpair before execvp() replaces the child's image. That filter (and
+ * therefore the listener fd) is inherited across any further fork(2)/
+ * exec(2) the child performs, so a single poll loop over that one fd is
+ * enough to service every intercepted syscall -- no further ptrace
+ * supervision is needed beyond the single initial exec-stop.
  *
  * Adapted from timewarp <https://github.com/renard/timewarp>.
  */
 
 #define _GNU_SOURCE
+#include <elf.h>
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,12 +46,27 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
+#include <sys/user.h>
 #include <sys/wait.h>
 
 #include <seccomp.h>
+
+/*
+ * disable_vdso() reads the stack pointer at the tracee's exec-stop to
+ * locate argc/argv/envp/auxv, which lives at a register that is named
+ * differently per architecture. Other architectures can be added here as
+ * needed; until then, fail loudly at compile time rather than silently
+ * reading the wrong register.
+ */
+#if defined(__x86_64__)
+#define FTBPF_REG_SP(regs) ((unsigned long)(regs).rsp)
+#else
+#error "faketime-bpf: disable_vdso() is not implemented for this architecture"
+#endif
 
 // Pass a file descriptor over a Unix socket via SCM_RIGHTS
 static int send_fd(int sock, int fd)
@@ -126,6 +151,60 @@ static int install_seccomp_filter(void)
         return -1;
     }
     return notif_fd;
+}
+
+/*
+ * Zero AT_SYSINFO_EHDR in the tracee's auxv so its C runtime skips the
+ * vDSO and always issues real clock_gettime/gettimeofday/time syscalls --
+ * without this, those are normally served straight out of a shared
+ * kernel page and never reach our seccomp filter at all.
+ *
+ * Must be called at the ptrace exec-stop: the kernel builds a fresh auxv
+ * for every execve(2), before a single instruction of the new image runs.
+ *
+ * This is the plain word-by-word PTRACE_PEEKDATA/PTRACE_POKEDATA scan
+ * (no process_vm_readv/writev fast path).
+ */
+static void disable_vdso(pid_t pid)
+{
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
+        perror("ptrace(PTRACE_GETREGS)");
+        return;
+    }
+
+    unsigned long sp = FTBPF_REG_SP(regs);
+
+    errno = 0;
+    long argc = ptrace(PTRACE_PEEKDATA, pid, (void *)sp, NULL);
+    if (errno) { perror("ptrace(PEEKDATA) argc"); return; }
+
+    // sp points at argc; skip argc, argv[0..argc-1] and argv's NULL terminator
+    unsigned long ptr = sp + (size_t)(argc + 2) * sizeof(long);
+
+    // Skip envp[] until its own NULL terminator
+    for (;;) {
+        errno = 0;
+        long v = ptrace(PTRACE_PEEKDATA, pid, (void *)ptr, NULL);
+        if (errno) { perror("ptrace(PEEKDATA) envp"); return; }
+        ptr += sizeof(long);
+        if (v == 0) break;
+    }
+
+    // Scan auxv[] for AT_SYSINFO_EHDR
+    for (;;) {
+        errno = 0;
+        long type = ptrace(PTRACE_PEEKDATA, pid, (void *)ptr, NULL);
+        if (errno) { perror("ptrace(PEEKDATA) auxv type"); return; }
+        if (type == AT_NULL) return;
+        if (type == AT_SYSINFO_EHDR) {
+            if (ptrace(PTRACE_POKEDATA, pid,
+                       (void *)(ptr + sizeof(long)), 0L) < 0)
+                perror("ptrace(POKEDATA) AT_SYSINFO_EHDR");
+            return;
+        }
+        ptr += 2 * sizeof(long);
+    }
 }
 
 // Write data directly into the tracee's address space
@@ -263,6 +342,17 @@ int main(int argc, char *argv[])
     if (child == 0) {
         close(sv[0]);
 
+        /*
+         * Stop immediately so the parent can set PTRACE_O_TRACEEXEC
+         * before we execvp(): it needs to catch the exec-stop to zero
+         * AT_SYSINFO_EHDR in the new image's auxv (see disable_vdso()).
+         */
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
+            perror("ptrace(PTRACE_TRACEME)");
+            _exit(1);
+        }
+        raise(SIGSTOP);
+
         int notif_fd = install_seccomp_filter();
         if (notif_fd < 0) _exit(1);
 
@@ -279,21 +369,49 @@ int main(int argc, char *argv[])
     }
 
     close(sv[1]);
+
+    int wstatus;
+    if (waitpid(child, &wstatus, 0) < 0) { perror("waitpid"); return 1; }
+    if (!WIFSTOPPED(wstatus)) {
+        fprintf(stderr, "faketime-bpf: unexpected initial child state\n");
+        return 1;
+    }
+    if (ptrace(PTRACE_SETOPTIONS, child, NULL,
+               (void *)(unsigned long)PTRACE_O_TRACEEXEC) < 0) {
+        perror("ptrace(PTRACE_SETOPTIONS)");
+        return 1;
+    }
+    if (ptrace(PTRACE_CONT, child, NULL, NULL) < 0) {
+        perror("ptrace(PTRACE_CONT)");
+        return 1;
+    }
+
     int notif_fd = recv_fd(sv[0]);
     close(sv[0]);
     if (notif_fd < 0) {
         fprintf(stderr, "faketime-bpf: failed to receive notification fd\n");
-        int wstatus;
         waitpid(child, &wstatus, 0);
         return 1;
     }
 
+    // Exec-stop: patch AT_SYSINFO_EHDR in the fresh auxv, then let it run
+    if (waitpid(child, &wstatus, 0) < 0) { perror("waitpid"); return 1; }
+    if (WIFSTOPPED(wstatus) &&
+        (wstatus >> 8) == (SIGTRAP | (PTRACE_EVENT_EXEC << 8))) {
+        disable_vdso(child);
+    }
+    if (ptrace(PTRACE_CONT, child, NULL, NULL) < 0) {
+        perror("ptrace(PTRACE_CONT)");
+        return 1;
+    }
+
     /*
-     * No ptrace supervision is needed: the filter (and thus this listener
-     * fd) is inherited across fork/exec by every descendant, so a single
-     * poll loop here covers the whole process tree. The kernel signals
-     * POLLHUP once no process holds the filter anymore, i.e. once the
-     * whole tree has exited.
+     * No further ptrace supervision is needed past the exec-stop above:
+     * the seccomp filter (and thus this listener fd) is inherited across
+     * any further fork/exec the tracee performs, so a single poll loop
+     * here covers it. The kernel signals POLLHUP once no process holds
+     * the filter anymore, i.e. once the tracee (and any descendants) has
+     * exited.
      */
     struct pollfd pfd = { .fd = notif_fd, .events = POLLIN };
     for (;;) {
@@ -310,7 +428,6 @@ int main(int argc, char *argv[])
     }
     close(notif_fd);
 
-    int wstatus;
     if (waitpid(child, &wstatus, 0) < 0) {
         perror("waitpid");
         return 1;
