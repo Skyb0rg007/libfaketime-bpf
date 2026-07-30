@@ -30,6 +30,7 @@ install:
 
 check: all test-time
 	./check.sh
+	./check-signals.sh
 
 clean:
 	$(RM) *.o faketime-bpf test-time

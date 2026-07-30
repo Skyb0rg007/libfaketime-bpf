@@ -36,8 +36,27 @@
  * socketpair before execvp() replaces the child's image. That filter (and
  * therefore the listener fd) is inherited across any further fork(2)/
  * exec(2) the child performs, so a single poll loop over that one fd is
- * enough to service every intercepted syscall -- no further ptrace
- * supervision is needed beyond the single initial exec-stop.
+ * enough to service every intercepted syscall.
+ *
+ * SIGNALS
+ * -------
+ * Once a process is ptrace(2)-attached, the kernel stops it on *every*
+ * signal delivery (not just exec), and that stop blocks until the tracer
+ * explicitly continues it -- a plain ptrace(PTRACE_CONT) after the initial
+ * exec-stop is not enough. Left unhandled, this deadlocks the very first
+ * time the tracee (or a shell it's running under) receives any signal at
+ * all, e.g. the SIGCHLD a shell gets when a subprocess it spawned exits.
+ * A signalfd for SIGCHLD drives a waitpid(WNOHANG) loop that continues
+ * every such stop (forwarding the stopping signal, or a later exec-stop's
+ * SIGTRAP suppressed as usual).
+ *
+ * A few common terminating signals (SIGINT, SIGTERM, SIGHUP, SIGQUIT) are
+ * blocked in this process and read via the same signalfd, then relayed to
+ * the tracee with kill(2) -- so e.g. Ctrl-C reaches the tracee whether or
+ * not it shares our terminal's foreground process group, and this process
+ * itself is never killed out from under the child it is supervising.
+ * PTRACE_O_EXITKILL covers the other direction (this process dying
+ * uncatchably, e.g. via SIGKILL) by having the kernel kill the tracee too.
  *
  * Adapted from timewarp <https://github.com/renard/timewarp>.
  */
@@ -55,6 +74,7 @@
 #include <unistd.h>
 
 #include <sys/ptrace.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -417,6 +437,47 @@ int main(int argc, char *argv[])
     }
     int64_t value_ns = make_value_ns(mode, fake_epoch);
 
+    /*
+     * POSIX shells set SIGINT/SIGQUIT to SIG_IGN for an asynchronous list
+     * ("cmd &"), so that an interactive Ctrl-C aimed at the foreground job
+     * doesn't also kill background ones -- and that disposition survives
+     * execve(2). Left alone, a signal whose disposition is SIG_IGN is
+     * discarded by the kernel the moment it is generated, before it can
+     * ever become pending: blocking it below would not help, signalfd
+     * would just never see it. Reset only these two (not SIGHUP: e.g.
+     * nohup(1) sets it to SIG_IGN deliberately, and that should still
+     * apply to the target command).
+     */
+    struct sigaction sa_dfl = { .sa_handler = SIG_DFL };
+    sigemptyset(&sa_dfl.sa_mask);
+    sigaction(SIGINT, &sa_dfl, NULL);
+    sigaction(SIGQUIT, &sa_dfl, NULL);
+
+    /*
+     * Block SIGCHLD (needed to drive the waitpid loop below) and a few
+     * common terminating signals (relayed to the tracee by hand, see the
+     * SIGNALS section up top) before forking, so signalfd reliably
+     * catches all of them. The child restores the default mask before
+     * exec so the target program's own signal handling is unaffected.
+     */
+    sigset_t sigmask;
+    sigemptyset(&sigmask);
+    sigaddset(&sigmask, SIGCHLD);
+    sigaddset(&sigmask, SIGINT);
+    sigaddset(&sigmask, SIGTERM);
+    sigaddset(&sigmask, SIGHUP);
+    sigaddset(&sigmask, SIGQUIT);
+    if (sigprocmask(SIG_BLOCK, &sigmask, NULL) < 0) {
+        perror("sigprocmask");
+        return 1;
+    }
+
+    int sfd = signalfd(-1, &sigmask, SFD_CLOEXEC | SFD_NONBLOCK);
+    if (sfd < 0) {
+        perror("signalfd");
+        return 1;
+    }
+
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {
         perror("socketpair");
@@ -431,6 +492,8 @@ int main(int argc, char *argv[])
 
     if (child == 0) {
         close(sv[0]);
+        close(sfd);
+        sigprocmask(SIG_UNBLOCK, &sigmask, NULL);
 
         /*
          * Stop immediately so the parent can set PTRACE_O_TRACEEXEC
@@ -467,7 +530,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     if (ptrace(PTRACE_SETOPTIONS, child, NULL,
-               (void *)(unsigned long)PTRACE_O_TRACEEXEC) < 0) {
+               (void *)(unsigned long)(PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL)) < 0) {
         perror("ptrace(PTRACE_SETOPTIONS)");
         return 1;
     }
@@ -496,29 +559,69 @@ int main(int argc, char *argv[])
     }
 
     /*
-     * No further ptrace supervision is needed past the exec-stop above:
-     * the seccomp filter (and thus this listener fd) is inherited across
+     * The seccomp filter (and thus this listener fd) is inherited across
      * any further fork/exec the tracee performs, so a single poll loop
-     * here covers it. The kernel signals POLLHUP once no process holds
-     * the filter anymore, i.e. once the tracee (and any descendants) has
-     * exited.
+     * over notif_fd and the signalfd covers the whole run. The kernel
+     * signals POLLHUP on notif_fd once no process holds the filter
+     * anymore, i.e. once the tracee (and any descendants) has exited.
      */
-    struct pollfd pfd = { .fd = notif_fd, .events = POLLIN };
+    int child_exited = 0;
+    struct pollfd pfds[2] = {
+        { .fd = notif_fd, .events = POLLIN },
+        { .fd = sfd,       .events = POLLIN },
+    };
     for (;;) {
-        int r = poll(&pfd, 1, -1);
+        int r = poll(pfds, 2, -1);
         if (r < 0) {
             if (errno == EINTR) continue;
             perror("poll");
             break;
         }
-        if (pfd.revents & POLLIN)
+
+        if (pfds[0].revents & POLLIN)
             handle_time_notif(notif_fd, mode, value_ns);
-        if ((pfd.revents & POLLHUP) && !(pfd.revents & POLLIN))
+        if ((pfds[0].revents & POLLHUP) && !(pfds[0].revents & POLLIN))
             break;
+
+        if (!(pfds[1].revents & POLLIN))
+            continue;
+
+        struct signalfd_siginfo ssi;
+        while (read(sfd, &ssi, sizeof(ssi)) == (ssize_t)sizeof(ssi)) {
+            if ((int)ssi.ssi_signo != SIGCHLD) {
+                // A terminating signal aimed at us: relay it to the tracee
+                kill(child, (int)ssi.ssi_signo);
+                continue;
+            }
+
+            for (;;) {
+                pid_t p = waitpid(child, &wstatus, WNOHANG);
+                if (p <= 0) break;
+
+                if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
+                    child_exited = 1;
+                    break;
+                }
+                if (!WIFSTOPPED(wstatus)) continue;
+
+                if ((wstatus >> 8) == (SIGTRAP | (PTRACE_EVENT_EXEC << 8))) {
+                    // A later exec(2) by the tracee itself: fresh auxv, patch it again
+                    disable_vdso(child);
+                    ptrace(PTRACE_CONT, child, NULL, NULL);
+                    continue;
+                }
+
+                // Generic signal-delivery-stop: forward the stopping signal
+                int sig = WSTOPSIG(wstatus);
+                if (sig == SIGTRAP && (wstatus >> 8) == 0) sig = 0;
+                ptrace(PTRACE_CONT, child, NULL, (void *)(long)sig);
+            }
+        }
     }
     close(notif_fd);
+    close(sfd);
 
-    if (waitpid(child, &wstatus, 0) < 0) {
+    if (!child_exited && waitpid(child, &wstatus, 0) < 0) {
         perror("waitpid");
         return 1;
     }
