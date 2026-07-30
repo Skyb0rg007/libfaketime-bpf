@@ -2,6 +2,9 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+PREFIX ?= /usr/local
+BINDIR = $(DESTDIR)$(PREFIX)/bin
+
 FTBPF_CFLAGS = -std=c99 -Wall -Wextra $(shell pkg-config --cflags libseccomp)
 FTBPF_LDFLAGS = $(shell pkg-config --libs-only-L --libs-only-other libseccomp)
 FTBPF_LDLIBS = $(shell pkg-config --libs-only-l libseccomp)
@@ -25,8 +28,8 @@ test-time: test-time.o
 test-time.o: test-time.c
 	$(CC) $(TEST_CFLAGS) $(CFLAGS) -c -o test-time.o test-time.c
 
-install:
-	:
+install: all
+	install -Dm755 faketime-bpf $(BINDIR)/faketime-bpf
 
 check: all test-time
 	./check.sh
