@@ -27,5 +27,6 @@ if [ "$probe_rc" -ne 0 ] && printf '%s\n' "$probe" | grep -q "seccomp user notif
 fi
 
 "$dir/check.sh"
+"$dir/check-descendants.sh"
 "$dir/check-signals.sh"
 "$dir/check-deadline.sh"

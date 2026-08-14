@@ -29,6 +29,13 @@
  * handed to the parent over a socketpair beforehand, and stays valid
  * across any further fork/exec the tracee performs.
  *
+ * The auxv patch, unlike the filter, does not survive into descendants:
+ * execve(2) rebuilds auxv from scratch, complete with a fresh
+ * AT_SYSINFO_EHDR, so a grandchild would go back to reading the real
+ * clock out of the vDSO. Tracing therefore follows the whole process
+ * tree -- PTRACE_O_TRACEFORK/VFORK/CLONE auto-attach every descendant --
+ * and each one's exec-stops get the same patch.
+ *
  * A ptrace-attached process stops on every signal delivery, not just
  * exec, and each stop blocks until the tracer continues it. A signalfd
  * for SIGCHLD drives a waitpid loop that continues every such stop,
@@ -89,10 +96,15 @@ static void usage(const char *prog);
 static int send_fd(int sock, int fd);
 static int recv_fd(int sock);
 
+// Live tracees
+static int track_pid(pid_t pid);
+static void forget_pid(pid_t pid);
+
 // seccomp + ptrace
 static int install_seccomp_filter(void);
 static int tracee_sp(pid_t pid, unsigned long *sp);
 static void disable_vdso(pid_t pid);
+static void reap_tracees(pid_t root, int *root_exited, int *root_status);
 static int read_from_child(pid_t pid, uint64_t remote_addr, void *data, size_t len);
 static int write_to_child(pid_t pid, uint64_t remote_addr, const void *data, size_t len);
 static int get_timerfd_clockid(pid_t pid, int fd);
@@ -203,9 +215,21 @@ int main(int argc, char *argv[])
         fprintf(stderr, "faketime-bpf: unexpected initial child state\n");
         return 1;
     }
+    /*
+     * These options are inherited by every auto-attached descendant, so
+     * setting them once here arms the whole tree: each fork/vfork/clone
+     * hands us the new process, and each of its execs stops for the auxv
+     * patch that keeps it off the vDSO.
+     */
     if (ptrace(PTRACE_SETOPTIONS, child, NULL,
-               (void *)(unsigned long)(PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL)) < 0) {
+               (void *)(unsigned long)(PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL |
+                                       PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
+                                       PTRACE_O_TRACECLONE)) < 0) {
         perror("ptrace(PTRACE_SETOPTIONS)");
+        return 1;
+    }
+    if (track_pid(child) < 0) {
+        perror("track_pid");
         return 1;
     }
     if (ptrace(PTRACE_CONT, child, NULL, NULL) < 0) {
@@ -268,28 +292,11 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            for (;;) {
-                pid_t p = waitpid(child, &wstatus, WNOHANG);
-                if (p <= 0) break;
-
-                if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
-                    child_exited = 1;
-                    break;
-                }
-                if (!WIFSTOPPED(wstatus)) continue;
-
-                if ((wstatus >> 8) == (SIGTRAP | (PTRACE_EVENT_EXEC << 8))) {
-                    // A later exec(2) by the tracee itself: fresh auxv, patch it again
-                    disable_vdso(child);
-                    ptrace(PTRACE_CONT, child, NULL, NULL);
-                    continue;
-                }
-
-                // Generic signal-delivery-stop: forward the stopping signal
-                int sig = WSTOPSIG(wstatus);
-                if (sig == SIGTRAP && (wstatus >> 8) == 0) sig = 0;
-                ptrace(PTRACE_CONT, child, NULL, (void *)(long)sig);
-            }
+            /*
+             * signalfd collapses repeats, so one SIGCHLD can stand for
+             * several state changes across the tree; drain them all.
+             */
+            reap_tracees(child, &child_exited, &wstatus);
         }
     }
     close(notif_fd);
@@ -432,6 +439,48 @@ static int recv_fd(int sock)
     return fd;
 }
 
+// --- Live tracees --------------------------------------------------------
+
+/*
+ * Every pid currently attached to us. Its only job is to tell a
+ * descendant's first stop -- the SIGSTOP the kernel raises when
+ * auto-attaching it, whose signal must be swallowed rather than injected
+ * -- apart from the ordinary signal-delivery stops that follow. Entries
+ * are dropped as processes exit, so pid reuse cannot alias a live one.
+ * Membership is a linear scan, which is fine: this holds only the
+ * processes alive at one instant, not every one ever spawned.
+ */
+static pid_t *tracees;
+static size_t num_tracees;
+static size_t tracees_cap;
+
+// 0 if pid was newly added, 1 if it was already known, -1 on allocation failure
+static int track_pid(pid_t pid)
+{
+    for (size_t i = 0; i < num_tracees; i++)
+        if (tracees[i] == pid) return 1;
+
+    if (num_tracees == tracees_cap) {
+        size_t cap = tracees_cap ? tracees_cap * 2 : 16;
+        pid_t *p = realloc(tracees, cap * sizeof(*tracees));
+        if (!p) return -1;
+        tracees     = p;
+        tracees_cap = cap;
+    }
+    tracees[num_tracees++] = pid;
+    return 0;
+}
+
+static void forget_pid(pid_t pid)
+{
+    for (size_t i = 0; i < num_tracees; i++) {
+        if (tracees[i] == pid) {
+            tracees[i] = tracees[--num_tracees];
+            return;
+        }
+    }
+}
+
 // --- seccomp + ptrace ----------------------------------------------------
 
 // Installs the seccomp-bpf filter; called by the child, before execvp()
@@ -537,6 +586,61 @@ static void disable_vdso(pid_t pid)
             return;
         }
         ptr += 2 * sizeof(long);
+    }
+}
+
+/*
+ * Continues every tracee with a state change pending, without blocking.
+ * root's exit status is reported back through root_exited/root_status;
+ * the rest of the tree is reaped for its own sake, since a tracee left
+ * stopped never runs again and a descendant that outlives root still
+ * holds the seccomp filter this process is listening on.
+ */
+static void reap_tracees(pid_t root, int *root_exited, int *root_status)
+{
+    for (;;) {
+        int wstatus;
+        pid_t pid = waitpid(-1, &wstatus, WNOHANG | __WALL);
+        if (pid <= 0) return;
+
+        if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
+            forget_pid(pid);
+            if (pid == root) {
+                *root_exited = 1;
+                *root_status = wstatus;
+            }
+            continue;
+        }
+        if (!WIFSTOPPED(wstatus)) continue;
+
+        /*
+         * A pid we have never seen is a freshly auto-attached descendant
+         * sitting at its attach stop. That stop's SIGSTOP is an artifact
+         * of the attach, so continue it with no signal; injecting it
+         * would stop the process for real.
+         */
+        if (track_pid(pid) != 1) {
+            ptrace(PTRACE_CONT, pid, NULL, NULL);
+            continue;
+        }
+
+        int event = wstatus >> 16;
+        if (event == PTRACE_EVENT_EXEC) {
+            // execve(2) rebuilt auxv from scratch, AT_SYSINFO_EHDR and all
+            disable_vdso(pid);
+            ptrace(PTRACE_CONT, pid, NULL, NULL);
+            continue;
+        }
+        if (event != 0) {
+            // fork/vfork/clone: the new process reports its own attach stop
+            ptrace(PTRACE_CONT, pid, NULL, NULL);
+            continue;
+        }
+
+        // Signal-delivery-stop: forward the stopping signal
+        int sig = WSTOPSIG(wstatus);
+        if (sig == SIGTRAP) sig = 0;
+        ptrace(PTRACE_CONT, pid, NULL, (void *)(long)sig);
     }
 }
 
