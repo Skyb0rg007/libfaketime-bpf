@@ -10,6 +10,8 @@
 # own children exit (delivering it SIGCHLD) does not deadlock.
 set -u
 
+: "${BUILDDIR:=_build}"
+
 status=0
 
 wait_for_child() {
@@ -28,7 +30,7 @@ wait_for_child() {
 }
 
 echo "SIGINT sent directly to faketime-bpf is relayed to the tracee:"
-./faketime-bpf 1700000000 sleep 30 &
+"$BUILDDIR/faketime-bpf" 1700000000 sleep 30 &
 bpf_pid=$!
 child_pid=$(wait_for_child "$bpf_pid" sleep) || {
     echo "FAIL: tracee (sleep) never showed up under faketime-bpf" >&2
@@ -52,7 +54,7 @@ if [ -n "${child_pid:-}" ]; then
 fi
 
 echo "PTRACE_O_EXITKILL cleans up the tracee if faketime-bpf is SIGKILLed:"
-./faketime-bpf 1700000000 sleep 30 &
+"$BUILDDIR/faketime-bpf" 1700000000 sleep 30 &
 bpf_pid=$!
 child_pid=$(wait_for_child "$bpf_pid" sleep) || {
     echo "FAIL: tracee (sleep) never showed up under faketime-bpf" >&2
@@ -72,8 +74,8 @@ if [ -n "${child_pid:-}" ]; then
 fi
 
 echo "a tracee whose own children exit (SIGCHLD) does not deadlock:"
-if timeout 10 ./faketime-bpf 1700000000 \
-        sh -c './test-time >/dev/null; sleep 1; ./test-time >/dev/null'
+if timeout 10 "$BUILDDIR/faketime-bpf" 1700000000 \
+        sh -c "'$BUILDDIR/test-time' >/dev/null; sleep 1; '$BUILDDIR/test-time' >/dev/null"
 then
     echo "  OK: sh -c with subprocess forks completed"
 else

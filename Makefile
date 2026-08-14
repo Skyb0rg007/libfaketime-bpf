@@ -5,6 +5,9 @@
 PREFIX ?= /usr/local
 BINDIR = $(DESTDIR)$(PREFIX)/bin
 
+SRCDIR ?= src
+BUILDDIR ?= _build
+
 FTBPF_CFLAGS = -std=c99 -Wall -Wextra $(shell pkg-config --cflags libseccomp)
 FTBPF_LDFLAGS = $(shell pkg-config --libs-only-L --libs-only-other libseccomp)
 FTBPF_LDLIBS = $(shell pkg-config --libs-only-l libseccomp)
@@ -14,26 +17,29 @@ TEST_CFLAGS = -std=c99 -Wall -Wextra
 .DEFAULT: all
 .PHONY: all install check clean
 
-all: faketime-bpf
+all: $(BUILDDIR)/faketime-bpf
 
-faketime-bpf: faketime-bpf.o
-	$(CC) $(FTBPF_LDFLAGS) $(LDFLAGS) -o faketime-bpf faketime-bpf.o $(FTBPF_LDLIBS) $(LDLIBS)
+$(BUILDDIR)/faketime-bpf: $(BUILDDIR)/faketime-bpf.o
+	$(CC) $(FTBPF_LDFLAGS) $(LDFLAGS) -o $@ $< $(FTBPF_LDLIBS) $(LDLIBS)
 
-faketime-bpf.o: faketime-bpf.c
-	$(CC) $(FTBPF_CFLAGS) $(CFLAGS) -c -o faketime-bpf.o faketime-bpf.c
+$(BUILDDIR)/faketime-bpf.o: $(SRCDIR)/faketime-bpf.c | $(BUILDDIR)
+	$(CC) $(FTBPF_CFLAGS) $(CFLAGS) -c -o $@ $<
 
-test-time: test-time.o
-	$(CC) $(LDFLAGS) -o test-time test-time.o $(LDLIBS)
+$(BUILDDIR)/test-time: $(BUILDDIR)/test-time.o
+	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-test-time.o: test-time.c
-	$(CC) $(TEST_CFLAGS) $(CFLAGS) -c -o test-time.o test-time.c
+$(BUILDDIR)/test-time.o: $(SRCDIR)/test-time.c | $(BUILDDIR)
+	$(CC) $(TEST_CFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(BUILDDIR):
+	mkdir -p $(BUILDDIR)
 
 install: all
-	install -Dm755 faketime-bpf $(BINDIR)/faketime-bpf
+	install -Dm755 $(BUILDDIR)/faketime-bpf $(BINDIR)/faketime-bpf
 
-check: all test-time
-	./check.sh
-	./check-signals.sh
+check: all $(BUILDDIR)/test-time
+	BUILDDIR=$(BUILDDIR) ./check.sh
+	BUILDDIR=$(BUILDDIR) ./check-signals.sh
 
 clean:
-	$(RM) *.o faketime-bpf test-time
+	$(RM) -r $(BUILDDIR)

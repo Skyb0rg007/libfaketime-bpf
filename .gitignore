@@ -5,6 +5,4 @@
 result
 result-*
 /.envrc
-*.o
-/faketime-bpf
-/test-time
+/_build/

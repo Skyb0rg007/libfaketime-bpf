@@ -9,16 +9,18 @@
 # mode behave as advertised across a real 1-second sleep.
 set -eu
 
+: "${BUILDDIR:=_build}"
+
 epoch=1700000000
 
-real=$(./test-time)
+real=$("$BUILDDIR/test-time")
 echo "unfaked:"
 echo "$real" | sed 's/^/  /'
 
 status=0
 
 echo "freeze mode (epoch=$epoch, no '@'):"
-freeze=$(./faketime-bpf "$epoch" ./test-time)
+freeze=$("$BUILDDIR/faketime-bpf" "$epoch" "$BUILDDIR/test-time")
 echo "$freeze" | sed 's/^/  /'
 for want in \
     "before clock_gettime: $epoch.000000000" "before gettimeofday: $epoch.000000" "before time: $epoch" \
@@ -31,7 +33,7 @@ do
 done
 
 echo "flow mode (epoch=@$epoch):"
-flow=$(./faketime-bpf "@$epoch" ./test-time)
+flow=$("$BUILDDIR/faketime-bpf" "@$epoch" "$BUILDDIR/test-time")
 echo "$flow" | sed 's/^/  /'
 
 before_time=$(echo "$flow" | awk '/^before time:/ { print $3 }')
