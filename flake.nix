@@ -27,26 +27,7 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          default = pkgs.stdenv.mkDerivation {
-            pname = "faketime-bpf";
-            version = "0.1.0";
-            src = ./.;
-
-            nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs = [ pkgs.libseccomp ];
-
-            nativeCheckInputs = [ pkgs.procps ];
-            doCheck = true;
-
-            installFlags = [ "PREFIX=$(out)" ];
-
-            meta = {
-              description = "faketime without LD_PRELOAD, using ptrace + seccomp-bpf";
-              license = lib.licenses.agpl3Plus;
-              platforms = lib.platforms.linux;
-              mainProgram = "faketime-bpf";
-            };
-          };
+          default = import ./default.nix { inherit pkgs; };
         }
       );
 
