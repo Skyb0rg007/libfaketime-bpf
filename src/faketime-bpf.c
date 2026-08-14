@@ -60,10 +60,7 @@
 
 #include <seccomp.h>
 
-// Stack-pointer register, per architecture
-#if defined(__x86_64__)
-#define FTBPF_REG_SP(regs) ((unsigned long)(regs).rsp)
-#else
+#if !defined(__x86_64__) && !defined(__aarch64__)
 #error "faketime-bpf: unsupported architecture"
 #endif
 
@@ -86,6 +83,7 @@ static int recv_fd(int sock);
 
 // seccomp + ptrace
 static int install_seccomp_filter(void);
+static int tracee_sp(pid_t pid, unsigned long *sp);
 static void disable_vdso(pid_t pid);
 static int write_to_child(pid_t pid, uint64_t remote_addr, const void *data, size_t len);
 static void handle_time_notif(int notif_fd, faketime_mode_t mode, int64_t value_ns);
@@ -421,18 +419,26 @@ static int install_seccomp_filter(void)
         return -1;
     }
 
+    /*
+     * Not every syscall exists on every architecture -- aarch64 has no
+     * separate time(2)/gettimeofday(2), glibc there builds both on top
+     * of clock_gettime(2) -- so a failed rule add is skipped rather than
+     * fatal, as long as at least one syscall is filtered.
+     */
     int syscalls[] = {
         SCMP_SYS(clock_gettime),
         SCMP_SYS(gettimeofday),
         SCMP_SYS(time),
     };
+    int added = 0;
     for (size_t i = 0; i < sizeof(syscalls) / sizeof(syscalls[0]); i++) {
-        int rc = seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, syscalls[i], 0);
-        if (rc < 0) {
-            fprintf(stderr, "seccomp_rule_add: %s\n", strerror(-rc));
-            seccomp_release(ctx);
-            return -1;
-        }
+        if (seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, syscalls[i], 0) == 0)
+            added++;
+    }
+    if (added == 0) {
+        fprintf(stderr, "seccomp_rule_add: no syscalls to filter on this architecture\n");
+        seccomp_release(ctx);
+        return -1;
     }
 
     int rc = seccomp_load(ctx);
@@ -451,16 +457,30 @@ static int install_seccomp_filter(void)
     return notif_fd;
 }
 
+// The tracee's stack pointer at its current ptrace-stop
+static int tracee_sp(pid_t pid, unsigned long *sp)
+{
+    struct user_regs_struct regs;
+#if defined(__x86_64__)
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) return -1;
+    *sp = (unsigned long)regs.rsp;
+#elif defined(__aarch64__)
+    // aarch64 glibc has no PTRACE_GETREGS; use the generic regset API instead
+    struct iovec iov = { &regs, sizeof(regs) };
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) < 0) return -1;
+    *sp = (unsigned long)regs.sp;
+#endif
+    return 0;
+}
+
 // Zeroes AT_SYSINFO_EHDR in the tracee's auxv; must run at each exec-stop, since the kernel rebuilds auxv on every execve(2)
 static void disable_vdso(pid_t pid)
 {
-    struct user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
-        perror("ptrace(PTRACE_GETREGS)");
+    unsigned long sp;
+    if (tracee_sp(pid, &sp) < 0) {
+        perror("ptrace(GETREGS)");
         return;
     }
-
-    unsigned long sp = FTBPF_REG_SP(regs);
 
     errno = 0;
     long argc = ptrace(PTRACE_PEEKDATA, pid, (void *)sp, NULL);

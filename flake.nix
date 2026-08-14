@@ -13,7 +13,10 @@
     { self, nixpkgs }:
     let
       inherit (nixpkgs) lib;
-      systems = [ "x86_64-linux" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
       forEachSystem = lib.genAttrs systems;
     in
     {
@@ -33,7 +36,9 @@
             buildInputs = [ pkgs.libseccomp ];
 
             nativeCheckInputs = [ pkgs.procps ];
-            doCheck = true;
+            # ptrace/seccomp user-notify aren't implemented by qemu-user, so
+            # skip checks when building aarch64-linux via binfmt emulation.
+            doCheck = system == "x86_64-linux";
 
             installFlags = [ "PREFIX=${placeholder "out"}" ];
 
