@@ -45,9 +45,9 @@ install: all
 	install -Dm755 $(BUILDDIR)/faketime-bpf $(BINDIR)/faketime-bpf
 
 check: all $(BUILDDIR)/test-time $(BUILDDIR)/test-deadline
-	BUILDDIR=$(BUILDDIR) ./check.sh
-	BUILDDIR=$(BUILDDIR) ./check-signals.sh
-	BUILDDIR=$(BUILDDIR) ./check-deadline.sh
+	BUILDDIR=$(BUILDDIR) $(TESTDIR)/check.sh
+	BUILDDIR=$(BUILDDIR) $(TESTDIR)/check-signals.sh
+	BUILDDIR=$(BUILDDIR) $(TESTDIR)/check-deadline.sh
 
 clean:
 	$(RM) -r $(BUILDDIR)
