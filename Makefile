@@ -39,13 +39,19 @@ $(BUILDDIR)/test-deadline: $(BUILDDIR)/test-deadline.o
 $(BUILDDIR)/test-deadline.o: $(TESTDIR)/test-deadline.c | $(BUILDDIR)
 	$(CC) $(TEST_CFLAGS) $(CFLAGS) -c -o $@ $<
 
+$(BUILDDIR)/test-cpu: $(BUILDDIR)/test-cpu.o
+	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+$(BUILDDIR)/test-cpu.o: $(TESTDIR)/test-cpu.c | $(BUILDDIR)
+	$(CC) $(TEST_CFLAGS) $(CFLAGS) -c -o $@ $<
+
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 install: all
 	install -Dm755 $(BUILDDIR)/faketime-bpf $(BINDIR)/faketime-bpf
 
-check: all $(BUILDDIR)/test-time $(BUILDDIR)/test-deadline
+check: all $(BUILDDIR)/test-time $(BUILDDIR)/test-deadline $(BUILDDIR)/test-cpu
 	$(TESTDIR)/run-checks.sh
 
 clean:

@@ -28,5 +28,6 @@ fi
 
 "$dir/check.sh"
 "$dir/check-descendants.sh"
+"$dir/check-cpu-time.sh"
 "$dir/check-signals.sh"
 "$dir/check-deadline.sh"

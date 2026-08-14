@@ -19,6 +19,17 @@
  * before letting the kernel run them, so it actually waits the intended
  * duration.
  *
+ * -c additionally makes consumed CPU time read as zero, through
+ * getrusage(2), times(2) and the CLOCK_PROCESS_CPUTIME_ID /
+ * CLOCK_THREAD_CPUTIME_ID clocks. A frozen wall clock is not enough for a
+ * reproducible build if the thing being built records how much CPU it
+ * took: no epoch makes that deterministic, because it measures work done
+ * rather than time passed, so the only stable answer is none at all.
+ * getrusage(2) reports more than CPU time and all of it is a property of
+ * the run, so the whole struct is zeroed rather than just the two time
+ * fields -- there is no way to intercept a syscall's result after the
+ * kernel has filled it in, only to answer in the kernel's place.
+ *
  * clock_gettime(CLOCK_REALTIME) and gettimeofday() are normally served
  * straight out of the vDSO, without a real syscall, so a seccomp filter
  * alone can't see them. The child is ptrace(2)-attached and, at every
@@ -51,6 +62,7 @@
  */
 
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -64,9 +76,11 @@
 #include <unistd.h>
 
 #include <sys/ptrace.h>
+#include <sys/resource.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include <sys/times.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/user.h>
@@ -90,6 +104,7 @@ static void unfake_deadline(faketime_mode_t mode, int64_t value_ns, struct times
 
 // Argument parsing
 static int parse_time_arg(const char *s, time_t *out, faketime_mode_t *mode);
+static int parse_options(int argc, char *argv[], int *fake_cpu);
 static void usage(const char *prog);
 
 // fd passing (seccomp listener fd, child to parent)
@@ -101,18 +116,21 @@ static int track_pid(pid_t pid);
 static void forget_pid(pid_t pid);
 
 // seccomp + ptrace
-static int install_seccomp_filter(void);
+static int install_seccomp_filter(int fake_cpu);
 static int tracee_sp(pid_t pid, unsigned long *sp);
 static void disable_vdso(pid_t pid);
 static void reap_tracees(pid_t root, int *root_exited, int *root_status);
 static int read_from_child(pid_t pid, uint64_t remote_addr, void *data, size_t len);
 static int write_to_child(pid_t pid, uint64_t remote_addr, const void *data, size_t len);
 static int get_timerfd_clockid(pid_t pid, int fd);
-static void handle_time_notif(int notif_fd, faketime_mode_t mode, int64_t value_ns);
+static void handle_time_notif(int notif_fd, faketime_mode_t mode, int64_t value_ns,
+                              int fake_cpu);
 
 int main(int argc, char *argv[])
 {
-    if (argc < 3) {
+    int fake_cpu = 0;
+    int argi = parse_options(argc, argv, &fake_cpu);
+    if (argi < 0 || argc - argi < 2) {
         usage(argv[0]);
         return 1;
     }
@@ -125,11 +143,12 @@ int main(int argc, char *argv[])
 
     time_t fake_epoch;
     faketime_mode_t mode;
-    if (!parse_time_arg(argv[1], &fake_epoch, &mode)) {
-        fprintf(stderr, "faketime-bpf: invalid time '%s' (expected [@]epoch)\n", argv[1]);
+    if (!parse_time_arg(argv[argi], &fake_epoch, &mode)) {
+        fprintf(stderr, "faketime-bpf: invalid time '%s' (expected [@]epoch)\n", argv[argi]);
         return 1;
     }
     int64_t value_ns = make_value_ns(mode, fake_epoch);
+    char **command = &argv[argi + 1];
 
     /*
      * POSIX shells set SIGINT/SIGQUIT to SIG_IGN for an asynchronous list
@@ -192,7 +211,7 @@ int main(int argc, char *argv[])
         }
         raise(SIGSTOP);
 
-        int notif_fd = install_seccomp_filter();
+        int notif_fd = install_seccomp_filter(fake_cpu);
         if (notif_fd < 0) _exit(1);
 
         if (send_fd(sv[1], notif_fd) < 0) {
@@ -202,8 +221,8 @@ int main(int argc, char *argv[])
         close(notif_fd);
         close(sv[1]);
 
-        execvp(argv[2], &argv[2]);
-        perror(argv[2]);
+        execvp(command[0], command);
+        perror(command[0]);
         _exit(127);
     }
 
@@ -277,7 +296,7 @@ int main(int argc, char *argv[])
         }
 
         if (pfds[0].revents & POLLIN)
-            handle_time_notif(notif_fd, mode, value_ns);
+            handle_time_notif(notif_fd, mode, value_ns, fake_cpu);
         if ((pfds[0].revents & POLLHUP) && !(pfds[0].revents & POLLIN))
             break;
 
@@ -389,12 +408,40 @@ static int parse_time_arg(const char *s, time_t *out, faketime_mode_t *mode)
     return 1;
 }
 
+/*
+ * Consumes leading options and returns the index of TIME, or -1 on an
+ * unrecognized one. Options stop at the first argument that is not one,
+ * so the command's own flags are left alone; "--" ends them explicitly,
+ * which is also how a negative TIME gets through.
+ */
+static int parse_options(int argc, char *argv[], int *fake_cpu)
+{
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+
+        if (!strcmp(a, "--")) return i + 1;
+        if (!strcmp(a, "-c") || !strcmp(a, "--fake-cpu-time")) {
+            *fake_cpu = 1;
+            continue;
+        }
+        if (a[0] == '-' && a[1] != '\0' && !isdigit((unsigned char)a[1])) {
+            fprintf(stderr, "faketime-bpf: unknown option '%s'\n", a);
+            return -1;
+        }
+        break;
+    }
+    return i;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s TIME command [args...]\n"
+            "usage: %s [-c] TIME command [args...]\n"
             "  EPOCH   freeze: clock stopped dead at this instant\n"
-            "  @EPOCH  flow: clock keeps advancing at real speed from here\n",
+            "  @EPOCH  flow: clock keeps advancing at real speed from here\n"
+            "  -c      consumed CPU time reads as zero, via getrusage(2),\n"
+            "          times(2) and the CPUTIME clocks (--fake-cpu-time)\n",
             prog);
 }
 
@@ -484,7 +531,7 @@ static void forget_pid(pid_t pid)
 // --- seccomp + ptrace ----------------------------------------------------
 
 // Installs the seccomp-bpf filter; called by the child, before execvp()
-static int install_seccomp_filter(void)
+static int install_seccomp_filter(int fake_cpu)
 {
     scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
     if (!ctx) {
@@ -510,6 +557,21 @@ static int install_seccomp_filter(void)
         if (seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, syscalls[i], 0) == 0)
             added++;
     }
+
+    /*
+     * The CPUTIME clocks come through clock_gettime(2), already filtered
+     * above; these two are the other ways to ask. They are only worth the
+     * trap when -c is in effect, since there is nothing to rewrite in
+     * them otherwise.
+     */
+    if (fake_cpu) {
+        int cpu_syscalls[] = { SCMP_SYS(getrusage), SCMP_SYS(times) };
+        for (size_t i = 0; i < sizeof(cpu_syscalls) / sizeof(cpu_syscalls[0]); i++) {
+            if (seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, cpu_syscalls[i], 0) == 0)
+                added++;
+        }
+    }
+
     if (added == 0) {
         fprintf(stderr, "seccomp_rule_add: no syscalls to filter on this architecture\n");
         seccomp_release(ctx);
@@ -692,7 +754,8 @@ static int get_timerfd_clockid(pid_t pid, int fd)
 }
 
 // Services one intercepted syscall, faking wall-time reads per mode/value_ns
-static void handle_time_notif(int notif_fd, faketime_mode_t mode, int64_t value_ns)
+static void handle_time_notif(int notif_fd, faketime_mode_t mode, int64_t value_ns,
+                              int fake_cpu)
 {
     struct seccomp_notif      *req  = NULL;
     struct seccomp_notif_resp *resp = NULL;
@@ -721,14 +784,53 @@ static void handle_time_notif(int notif_fd, faketime_mode_t mode, int64_t value_
 
     case SCMP_SYS(clock_gettime): {
         clockid_t clockid = (clockid_t)(int32_t)req->data.args[0];
-        if (clockid != CLOCK_REALTIME && clockid != CLOCK_REALTIME_COARSE) {
+        struct timespec ts;
+
+        if (fake_cpu && (clockid == CLOCK_PROCESS_CPUTIME_ID ||
+                         clockid == CLOCK_THREAD_CPUTIME_ID)) {
+            ts.tv_sec = 0;
+            ts.tv_nsec = 0;
+        } else if (clockid == CLOCK_REALTIME || clockid == CLOCK_REALTIME_COARSE) {
+            fake_now(mode, value_ns, &ts);
+        } else {
             resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
             break;
         }
-        struct timespec ts;
-        fake_now(mode, value_ns, &ts);
+
         if (write_to_child(req->pid, req->data.args[1], &ts, sizeof(ts)) < 0)
             resp->error = -errno;
+        break;
+    }
+
+    case SCMP_SYS(getrusage): {
+        int who = (int)(int32_t)req->data.args[0];
+        if (who != RUSAGE_SELF && who != RUSAGE_CHILDREN && who != RUSAGE_THREAD) {
+            // Let the kernel reject it, so the errno matches what it would be
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            break;
+        }
+        if (!req->data.args[1]) {
+            resp->error = -EFAULT;
+            break;
+        }
+        struct rusage ru;
+        memset(&ru, 0, sizeof(ru));
+        if (write_to_child(req->pid, req->data.args[1], &ru, sizeof(ru)) < 0)
+            resp->error = -errno;
+        break;
+    }
+
+    case SCMP_SYS(times): {
+        // A NULL buffer is allowed here; the tick count is the return value
+        if (req->data.args[0]) {
+            struct tms t;
+            memset(&t, 0, sizeof(t));
+            if (write_to_child(req->pid, req->data.args[0], &t, sizeof(t)) < 0) {
+                resp->error = -errno;
+                break;
+            }
+        }
+        resp->val = 0;
         break;
     }
 
