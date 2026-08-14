@@ -8,6 +8,7 @@ BINDIR = $(DESTDIR)$(PREFIX)/bin
 SRCDIR ?= src
 TESTDIR ?= tests
 BUILDDIR ?= _build
+export BUILDDIR
 
 FTBPF_CFLAGS = -std=c99 -Wall -Wextra $(shell pkg-config --cflags libseccomp)
 FTBPF_LDFLAGS = $(shell pkg-config --libs-only-L --libs-only-other libseccomp)
@@ -45,9 +46,9 @@ install: all
 	install -Dm755 $(BUILDDIR)/faketime-bpf $(BINDIR)/faketime-bpf
 
 check: all $(BUILDDIR)/test-time $(BUILDDIR)/test-deadline
-	BUILDDIR=$(BUILDDIR) $(TESTDIR)/check.sh
-	BUILDDIR=$(BUILDDIR) $(TESTDIR)/check-signals.sh
-	BUILDDIR=$(BUILDDIR) $(TESTDIR)/check-deadline.sh
+	$(TESTDIR)/check.sh
+	$(TESTDIR)/check-signals.sh
+	$(TESTDIR)/check-deadline.sh
 
 clean:
 	$(RM) -r $(BUILDDIR)
