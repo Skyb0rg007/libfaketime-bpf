@@ -36,9 +36,7 @@
             buildInputs = [ pkgs.libseccomp ];
 
             nativeCheckInputs = [ pkgs.procps ];
-            # ptrace/seccomp user-notify aren't implemented by qemu-user, so
-            # skip checks when building aarch64-linux via binfmt emulation.
-            doCheck = system == "x86_64-linux";
+            doCheck = true;
 
             installFlags = [ "PREFIX=$(out)" ];
 
