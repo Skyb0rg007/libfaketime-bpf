@@ -6,6 +6,7 @@ PREFIX ?= /usr/local
 BINDIR = $(DESTDIR)$(PREFIX)/bin
 
 SRCDIR ?= src
+TESTDIR ?= tests
 BUILDDIR ?= _build
 
 FTBPF_CFLAGS = -std=c99 -Wall -Wextra $(shell pkg-config --cflags libseccomp)
@@ -28,13 +29,13 @@ $(BUILDDIR)/faketime-bpf.o: $(SRCDIR)/faketime-bpf.c | $(BUILDDIR)
 $(BUILDDIR)/test-time: $(BUILDDIR)/test-time.o
 	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-$(BUILDDIR)/test-time.o: $(SRCDIR)/test-time.c | $(BUILDDIR)
+$(BUILDDIR)/test-time.o: $(TESTDIR)/test-time.c | $(BUILDDIR)
 	$(CC) $(TEST_CFLAGS) $(CFLAGS) -c -o $@ $<
 
 $(BUILDDIR)/test-deadline: $(BUILDDIR)/test-deadline.o
 	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-$(BUILDDIR)/test-deadline.o: $(SRCDIR)/test-deadline.c | $(BUILDDIR)
+$(BUILDDIR)/test-deadline.o: $(TESTDIR)/test-deadline.c | $(BUILDDIR)
 	$(CC) $(TEST_CFLAGS) $(CFLAGS) -c -o $@ $<
 
 $(BUILDDIR):
