@@ -40,7 +40,7 @@
             # skip checks when building aarch64-linux via binfmt emulation.
             doCheck = system == "x86_64-linux";
 
-            installFlags = [ "PREFIX=${placeholder "out"}" ];
+            installFlags = [ "PREFIX=$(out)" ];
 
             meta = {
               description = "faketime without LD_PRELOAD, using ptrace + seccomp-bpf";
