@@ -31,15 +31,22 @@ $(BUILDDIR)/test-time: $(BUILDDIR)/test-time.o
 $(BUILDDIR)/test-time.o: $(SRCDIR)/test-time.c | $(BUILDDIR)
 	$(CC) $(TEST_CFLAGS) $(CFLAGS) -c -o $@ $<
 
+$(BUILDDIR)/test-deadline: $(BUILDDIR)/test-deadline.o
+	$(CC) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+$(BUILDDIR)/test-deadline.o: $(SRCDIR)/test-deadline.c | $(BUILDDIR)
+	$(CC) $(TEST_CFLAGS) $(CFLAGS) -c -o $@ $<
+
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 install: all
 	install -Dm755 $(BUILDDIR)/faketime-bpf $(BINDIR)/faketime-bpf
 
-check: all $(BUILDDIR)/test-time
+check: all $(BUILDDIR)/test-time $(BUILDDIR)/test-deadline
 	BUILDDIR=$(BUILDDIR) ./check.sh
 	BUILDDIR=$(BUILDDIR) ./check-signals.sh
+	BUILDDIR=$(BUILDDIR) ./check-deadline.sh
 
 clean:
 	$(RM) -r $(BUILDDIR)

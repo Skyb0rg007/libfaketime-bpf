@@ -12,7 +12,12 @@
  * TIME is a unix epoch: a bare epoch freezes the clock at that instant;
  * an '@'-prefixed epoch sets a start-at instant that the clock keeps
  * advancing from at real speed (libfaketime's freeze/flow convention).
- * Only clock_gettime(2), gettimeofday(2) and time(2) are intercepted.
+ * clock_gettime(2), gettimeofday(2) and time(2) are intercepted to serve
+ * the faked clock; clock_nanosleep(2) and timerfd_settime(2) are also
+ * intercepted, but only to rewrite absolute wall-clock deadlines that the
+ * tracee computed against the faked clock back into real-clock terms
+ * before letting the kernel run them, so it actually waits the intended
+ * duration.
  *
  * clock_gettime(CLOCK_REALTIME) and gettimeofday() are normally served
  * straight out of the vDSO, without a real syscall, so a seccomp filter
@@ -41,6 +46,7 @@
 #define _GNU_SOURCE
 #include <elf.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -53,6 +59,7 @@
 #include <sys/ptrace.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/user.h>
@@ -72,6 +79,7 @@ static int64_t timespec_to_ns(const struct timespec *ts);
 static void ns_to_timespec(int64_t total_ns, struct timespec *ts);
 static int64_t make_value_ns(faketime_mode_t mode, time_t fake_epoch);
 static void fake_now(faketime_mode_t mode, int64_t value_ns, struct timespec *ts);
+static void unfake_deadline(faketime_mode_t mode, int64_t value_ns, struct timespec *ts);
 
 // Argument parsing
 static int parse_time_arg(const char *s, time_t *out, faketime_mode_t *mode);
@@ -85,7 +93,9 @@ static int recv_fd(int sock);
 static int install_seccomp_filter(void);
 static int tracee_sp(pid_t pid, unsigned long *sp);
 static void disable_vdso(pid_t pid);
+static int read_from_child(pid_t pid, uint64_t remote_addr, void *data, size_t len);
 static int write_to_child(pid_t pid, uint64_t remote_addr, const void *data, size_t len);
+static int get_timerfd_clockid(pid_t pid, int fd);
 static void handle_time_notif(int notif_fd, faketime_mode_t mode, int64_t value_ns);
 
 int main(int argc, char *argv[])
@@ -337,6 +347,20 @@ static void fake_now(faketime_mode_t mode, int64_t value_ns, struct timespec *ts
     ns_to_timespec(timespec_to_ns(&real) + value_ns, ts);
 }
 
+// Converts an absolute deadline the tracee computed against the faked clock back into real-clock terms, so the kernel waits the intended duration
+static void unfake_deadline(faketime_mode_t mode, int64_t value_ns, struct timespec *ts)
+{
+    if (mode == FT_MODE_FREEZE) {
+        // The deadline was an offset from the frozen "now"; honor it as a real-time duration from the current instant
+        struct timespec real_now;
+        clock_gettime(CLOCK_REALTIME, &real_now);
+        ns_to_timespec(timespec_to_ns(ts) - value_ns + timespec_to_ns(&real_now), ts);
+        return;
+    }
+
+    ns_to_timespec(timespec_to_ns(ts) - value_ns, ts);
+}
+
 // --- Argument parsing ---------------------------------------------------
 
 // A unix epoch, e.g. "1700000000" (freeze) or "@1700000000" (flow)
@@ -429,6 +453,8 @@ static int install_seccomp_filter(void)
         SCMP_SYS(clock_gettime),
         SCMP_SYS(gettimeofday),
         SCMP_SYS(time),
+        SCMP_SYS(clock_nanosleep),
+        SCMP_SYS(timerfd_settime),
     };
     int added = 0;
     for (size_t i = 0; i < sizeof(syscalls) / sizeof(syscalls[0]); i++) {
@@ -514,6 +540,19 @@ static void disable_vdso(pid_t pid)
     }
 }
 
+// Reads data directly out of the tracee's address space
+static int read_from_child(pid_t pid, uint64_t remote_addr, void *data, size_t len)
+{
+    if (!remote_addr) return -1;
+    struct iovec local  = { data,                len };
+    struct iovec remote = { (void *)remote_addr, len };
+    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+        perror("process_vm_readv");
+        return -1;
+    }
+    return 0;
+}
+
 // Writes data directly into the tracee's address space
 static int write_to_child(pid_t pid, uint64_t remote_addr,
                            const void *data, size_t len)
@@ -526,6 +565,26 @@ static int write_to_child(pid_t pid, uint64_t remote_addr,
         return -1;
     }
     return 0;
+}
+
+// Returns the clockid a timerfd was created with, by reading /proc/<pid>/fdinfo/<fd> -- avoids tracking fd -> clockid across fork/dup/SCM_RIGHTS
+static int get_timerfd_clockid(pid_t pid, int fd)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/fdinfo/%d", pid, fd);
+    int f = open(path, O_RDONLY | O_CLOEXEC);
+    if (f < 0) return -1;
+
+    char buf[512];
+    ssize_t n = read(f, buf, sizeof(buf) - 1);
+    close(f);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    int clockid = -1;
+    char *p = strstr(buf, "clockid:");
+    if (p) sscanf(p, "clockid: %d", &clockid);
+    return clockid;
 }
 
 // Services one intercepted syscall, faking wall-time reads per mode/value_ns
@@ -588,6 +647,73 @@ static void handle_time_notif(int notif_fd, faketime_mode_t mode, int64_t value_
         resp->val  = (int64_t)now;
         if (write_to_child(req->pid, req->data.args[0], &now, sizeof(now)) < 0)
             resp->error = -errno;
+        break;
+    }
+
+    case SCMP_SYS(clock_nanosleep): {
+        /*
+         * Only an absolute deadline on a wall clock needs fixing up: it was
+         * computed against the faked clock, so must be converted back to
+         * real-clock terms before the kernel runs it. Relative sleeps and
+         * non-wall clocks are correct as-is.
+         */
+        clockid_t clockid = (clockid_t)(int32_t)req->data.args[0];
+        int       flags   = (int)req->data.args[1];
+        if (!(flags & TIMER_ABSTIME) ||
+            (clockid != CLOCK_REALTIME &&
+             clockid != CLOCK_REALTIME_COARSE &&
+             clockid != CLOCK_TAI)) {
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            break;
+        }
+
+        struct timespec ts;
+        if (read_from_child(req->pid, req->data.args[2], &ts, sizeof(ts)) < 0) {
+            resp->error = -errno;
+            break;
+        }
+        unfake_deadline(mode, value_ns, &ts);
+        if (write_to_child(req->pid, req->data.args[2], &ts, sizeof(ts)) < 0) {
+            resp->error = -errno;
+            break;
+        }
+        resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        break;
+    }
+
+    case SCMP_SYS(timerfd_settime): {
+        /*
+         * As above, only an absolute expiration on a wall clock needs
+         * fixing up. timerfd_gettime(2) isn't intercepted, so the caller's
+         * old_value output (args[3]) is left in real-clock terms.
+         */
+        int fd    = (int)req->data.args[0];
+        int flags = (int)req->data.args[1];
+        if (!(flags & TFD_TIMER_ABSTIME)) {
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            break;
+        }
+
+        int clockid = get_timerfd_clockid(req->pid, fd);
+        if (clockid != CLOCK_REALTIME &&
+            clockid != CLOCK_REALTIME_COARSE &&
+            clockid != CLOCK_TAI) {
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            break;
+        }
+
+        struct itimerspec its;
+        if (read_from_child(req->pid, req->data.args[2], &its, sizeof(its)) < 0) {
+            resp->error = -errno;
+            break;
+        }
+        // it_value is the absolute expiry to fix up; it_interval is a relative period and is left alone
+        unfake_deadline(mode, value_ns, &its.it_value);
+        if (write_to_child(req->pid, req->data.args[2], &its, sizeof(its)) < 0) {
+            resp->error = -errno;
+            break;
+        }
+        resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
         break;
     }
 
